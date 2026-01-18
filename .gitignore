@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+.ipynb_checkpoints/
+
+# Data & outputs
+data/
+artifacts/
+results/
+*.ckpt
+*.pt
+*.pth
+*.npz
+*.npy
+*.csv
+*.parquet
+
+# OS
+.DS_Store

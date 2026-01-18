@@ -1,0 +1,9 @@
+[project]
+name = "stgnn-benchmark"
+version = "0.1.0"
+description = "Benchmark for spatio-temporal forecasting under dynamic graphs and structural shifts."
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas", "pyyaml", "tqdm"]
+
+[tool.ruff]
+line-length = 100
