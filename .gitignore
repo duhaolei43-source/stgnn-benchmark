@@ -8,6 +8,18 @@ dist/
 build/
 .venv/
 .ipynb_checkpoints/
+# Experiment logs
+wandb/
+
+# Artifacts & local data
+artifacts/
+data/
+results/
+
+# Python junk
+__pycache__/
+*.pyc
+.DS_Store
 
 # Data & outputs
 data/
