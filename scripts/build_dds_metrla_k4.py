@@ -38,6 +38,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--train_ratio", type=float, default=0.7, help="Train split ratio.")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Val split ratio.")
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Optional split json path (artifacts/splits/metr-la/split_v1.json).",
+    )
     args = parser.parse_args()
 
     build_dds_graphs_metrla_k4(
@@ -47,6 +52,7 @@ def main() -> int:
         seed=args.seed,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
+        split_json_path=args.split,
     )
 
     expected = _expected_outputs(args.out)

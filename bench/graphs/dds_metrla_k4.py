@@ -1,7 +1,7 @@
 import json
 import os
 import warnings
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -151,6 +151,43 @@ def _load_metrla_h5(data_h5_path: str) -> np.ndarray:
     raise ValueError(message)
 
 
+def _validate_range(name: str, value: object, num_steps: int, required: bool) -> Optional[List[int]]:
+    if value is None:
+        if required:
+            raise ValueError(f"Split json missing required {name}.")
+        return None
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{name} must be a list of two integers.")
+    start, end = value
+    if not isinstance(start, int) or not isinstance(end, int):
+        raise ValueError(f"{name} entries must be integers.")
+    if start < 0 or end < 0 or start > end:
+        raise ValueError(f"{name} must satisfy 0 <= start <= end.")
+    if end >= num_steps:
+        raise ValueError(f"{name} end must be < num_steps ({num_steps}).")
+    return [start, end]
+
+
+def _load_split_json(split_json_path: str, num_steps: int) -> Dict[str, Optional[List[int]]]:
+    with open(split_json_path, "r", encoding="utf-8") as f:
+        split_data = json.load(f)
+
+    if "num_steps" in split_data and split_data["num_steps"] != num_steps:
+        warnings.warn(
+            f"Split json num_steps ({split_data['num_steps']}) does not match H5 length ({num_steps})."
+        )
+
+    train_range = _validate_range("train_range", split_data.get("train_range"), num_steps, required=True)
+    val_range = _validate_range("val_range", split_data.get("val_range"), num_steps, required=False)
+    test_range = _validate_range("test_range", split_data.get("test_range"), num_steps, required=False)
+
+    return {
+        "train_range": train_range,
+        "val_range": val_range,
+        "test_range": test_range,
+    }
+
+
 def _compute_corr_matrix(slot_data: np.ndarray, num_nodes: int) -> np.ndarray:
     if slot_data.shape[0] < 2:
         corr = np.zeros((num_nodes, num_nodes), dtype=np.float64)
@@ -211,6 +248,7 @@ def build_dds_graphs_metrla_k4(
     seed: int = 0,
     train_ratio: float = 0.7,
     val_ratio: float = 0.1,
+    split_json_path: Optional[str] = None,
 ) -> Dict[str, object]:
     np.random.seed(seed)
 
@@ -219,8 +257,34 @@ def build_dds_graphs_metrla_k4(
     if data.ndim != 2:
         raise ValueError(f"Expected 2D (T, N) data array, got shape {data.shape}.")
 
-    train_end = int(num_steps * train_ratio)
-    train_indices = np.arange(train_end, dtype=np.int64)
+    split_source = "ratio"
+    split_meta: Dict[str, object] = {}
+    if split_json_path:
+        split_source = "json"
+        split_ranges = _load_split_json(split_json_path, num_steps)
+        train_start, train_end = split_ranges["train_range"]
+        train_indices = np.arange(train_start, train_end + 1, dtype=np.int64)
+        split_meta = {
+            "split_json_path": split_json_path,
+            "train_range": split_ranges["train_range"],
+        }
+        if split_ranges["val_range"] is not None:
+            split_meta["val_range"] = split_ranges["val_range"]
+        if split_ranges["test_range"] is not None:
+            split_meta["test_range"] = split_ranges["test_range"]
+    else:
+        train_end_exclusive = int(num_steps * train_ratio)
+        train_indices = np.arange(train_end_exclusive, dtype=np.int64)
+        train_start = 0
+        train_end = train_end_exclusive - 1
+
+    if split_source == "json":
+        print(
+            f"Split source: json ({split_json_path}) train_range=[{train_start},{train_end}]"
+        )
+    else:
+        print(f"Split source: ratio train_range=[{train_start},{train_end}]")
+
     train_steps_of_day = train_indices % 288
     slot_ids = np.array(
         [get_slot_id_from_step(int(step), K=4) for step in train_steps_of_day],
@@ -238,10 +302,11 @@ def build_dds_graphs_metrla_k4(
 
     for k in range(4):
         slot_indices = train_indices[slot_ids == k]
-        if slot_indices.size > 0 and int(slot_indices.max()) >= train_end:
-            raise RuntimeError(
-                f"Slot {k} indices leak beyond train_end ({train_end}): max={slot_indices.max()}"
-            )
+        if slot_indices.size > 0:
+            if int(slot_indices.min()) < train_start or int(slot_indices.max()) > train_end:
+                raise RuntimeError(
+                    f"Slot {k} indices leak beyond train_range [{train_start}, {train_end}]."
+                )
         slot_counts[k] = int(slot_indices.shape[0])
         slot_data = data[slot_indices]
 
@@ -324,10 +389,13 @@ def build_dds_graphs_metrla_k4(
         "seed": seed,
         "train_ratio": train_ratio,
         "val_ratio": val_ratio,
-        "train_time_index_range": [0, max(train_end - 1, 0)],
+        "train_time_index_range": [train_start, train_end],
         "num_nodes": num_nodes,
         "num_train_steps_per_slot": slot_counts,
+        "split_source": split_source,
     }
+    if split_source == "json":
+        meta.update(split_meta)
     meta_path = os.path.join(out_dir, "meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, sort_keys=True)
@@ -379,7 +447,7 @@ def build_dds_graphs_metrla_k4(
         "seed": seed,
         "slot_boundaries": SLOT_BOUNDARIES,
         "num_nodes": num_nodes,
-        "num_train_steps": int(train_end),
+        "num_train_steps": int(train_indices.shape[0]),
         "paths": paths,
         "diagnostics": diagnostics,
     }
