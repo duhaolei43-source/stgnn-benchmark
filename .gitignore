@@ -12,9 +12,9 @@ build/
 wandb/
 
 # Artifacts & local data
-artifacts/
-data/
-results/
+/artifacts/
+/data/
+/results/
 
 # Python junk
 __pycache__/
@@ -22,9 +22,10 @@ __pycache__/
 .DS_Store
 
 # Data & outputs
-data/
-artifacts/
-results/
+/data/
+/artifacts/
+/results/
+/wandb/
 *.ckpt
 *.pt
 *.pth
