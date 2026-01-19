@@ -1,0 +1,4 @@
+VENDORED FROM: https://github.com/LeronQ/STGCN-Pytorch
+METHOD: GitHub ZIP download (manual vendor)
+DATE: 2026-01-19
+NOTE: Network issues prevented git subtree fetch.
