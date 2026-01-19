@@ -36,3 +36,7 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# vendor / external repo data
+bench/models/stgcn/vendor/stgcn_pytorch/data/
+
