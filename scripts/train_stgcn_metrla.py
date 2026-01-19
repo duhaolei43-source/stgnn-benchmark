@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import time
 from typing import Dict, Tuple
 
 import numpy as np
@@ -97,6 +98,7 @@ def _evaluate(
     adj: torch.Tensor,
     mean: float,
     std: float,
+    mape_eps: float,
 ) -> Dict[str, Dict[str, float]]:
     model.eval()
     horizon_indices = list(HORIZON_INDICES.keys())
@@ -109,7 +111,7 @@ def _evaluate(
             pred = pred.permute(0, 2, 1)
             pred = pred * std + mean
             y = y * std + mean
-            update_metric_acc(acc, pred, y, horizon_indices)
+            update_metric_acc(acc, pred, y, horizon_indices, eps=mape_eps)
     finalized = finalize_metric_acc(acc)
     results: Dict[str, Dict[str, float]] = {}
     for idx, metrics in finalized.items():
@@ -128,6 +130,29 @@ def _format_metrics(prefix: str, metrics: Dict[str, Dict[str, float]]) -> str:
     return f"{prefix}: " + " | ".join(parts)
 
 
+def _aggregate_mae(metrics: Dict[str, Dict[str, float]]) -> float:
+    values = [metrics[label]["mae"] for label in ["15", "30", "60"] if label in metrics]
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _checkpoint_state(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    best_val_mae: float,
+    config: Dict[str, object],
+) -> Dict[str, object]:
+    return {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_val_mae": best_val_mae,
+        "config": config,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="One-touch STGCN training on METR-LA.")
     parser.add_argument("--data", required=True, help="Path to metr-la.h5")
@@ -140,6 +165,10 @@ def main() -> int:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
+    parser.add_argument("--mape_eps", type=float, default=1e-5, help="MAPE epsilon clamp.")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
+    parser.add_argument("--min_delta", type=float, default=0.0, help="Early stopping min delta.")
+    parser.add_argument("--run_id", default=None, help="Checkpoint run id (defaults to timestamp).")
     parser.add_argument("--wandb", type=int, default=0, help="Enable wandb (0/1).")
     parser.add_argument("--wandb_project", default="stgnn-benchmark", help="Wandb project name.")
     parser.add_argument("--wandb_run_name", default=None, help="Wandb run name.")
@@ -178,6 +207,11 @@ def main() -> int:
         f"adj={args.adj} device={device}"
     )
 
+    run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
+    ckpt_dir = os.path.join("artifacts", "checkpoints", "stgcn", run_id)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    config_snapshot = dict(vars(args))
+
     use_wandb = args.wandb == 1
     wandb = None
     if use_wandb:
@@ -186,6 +220,9 @@ def main() -> int:
         wandb = _wandb
         wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
 
+    best_val_mae = float("inf")
+    best_epoch = -1
+    patience_counter = 0
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -210,37 +247,77 @@ def main() -> int:
         if wandb is not None:
             wandb.log({"train_loss": epoch_loss, "epoch": epoch + 1})
 
-    train_metrics = _evaluate(
-        model, train_loader, device, adj_tensor, meta["mean"], meta["std"]
-    )
-    print(_format_metrics("TRAIN metrics", train_metrics))
-
-    if val_loader is not None:
-        val_metrics = _evaluate(
-            model, val_loader, device, adj_tensor, meta["mean"], meta["std"]
+        train_metrics = _evaluate(
+            model,
+            train_loader,
+            device,
+            adj_tensor,
+            meta["mean"],
+            meta["std"],
+            args.mape_eps,
         )
-        print(_format_metrics("VAL metrics", val_metrics))
-    else:
-        val_metrics = {}
-        print("VAL metrics: skipped (no val_range)")
+        print(_format_metrics(f"Epoch {epoch + 1} TRAIN", train_metrics))
 
-    if wandb is not None:
-        for label, metrics in train_metrics.items():
-            wandb.log(
-                {
-                    f"train/mae_{label}": metrics["mae"],
-                    f"train/mape_{label}": metrics["mape"],
-                    f"train/rmse_{label}": metrics["rmse"],
-                }
+        if val_loader is not None:
+            val_metrics = _evaluate(
+                model,
+                val_loader,
+                device,
+                adj_tensor,
+                meta["mean"],
+                meta["std"],
+                args.mape_eps,
             )
-        for label, metrics in val_metrics.items():
-            wandb.log(
-                {
-                    f"val/mae_{label}": metrics["mae"],
-                    f"val/mape_{label}": metrics["mape"],
-                    f"val/rmse_{label}": metrics["rmse"],
-                }
+            print(_format_metrics(f"Epoch {epoch + 1} VAL", val_metrics))
+        else:
+            val_metrics = {}
+            print(f"Epoch {epoch + 1} VAL: skipped (no val_range)")
+
+        if wandb is not None:
+            for label, metrics in train_metrics.items():
+                wandb.log(
+                    {
+                        f"train/mae_{label}": metrics["mae"],
+                        f"train/mape_{label}": metrics["mape"],
+                        f"train/rmse_{label}": metrics["rmse"],
+                        "epoch": epoch + 1,
+                    }
+                )
+            for label, metrics in val_metrics.items():
+                wandb.log(
+                    {
+                        f"val/mae_{label}": metrics["mae"],
+                        f"val/mape_{label}": metrics["mape"],
+                        f"val/rmse_{label}": metrics["rmse"],
+                        "epoch": epoch + 1,
+                    }
+                )
+
+        current_val_mae = _aggregate_mae(val_metrics) if val_loader is not None else None
+        if current_val_mae is not None:
+            if current_val_mae < best_val_mae - args.min_delta:
+                best_val_mae = current_val_mae
+                best_epoch = epoch + 1
+                patience_counter = 0
+                best_state = _checkpoint_state(
+                    model, optimizer, epoch + 1, best_val_mae, config_snapshot
+                )
+                torch.save(best_state, os.path.join(ckpt_dir, "best.pt"))
+            else:
+                patience_counter += 1
+
+        last_state = _checkpoint_state(
+            model, optimizer, epoch + 1, best_val_mae, config_snapshot
+        )
+        torch.save(last_state, os.path.join(ckpt_dir, "last.pt"))
+
+        if current_val_mae is not None and patience_counter >= args.patience:
+            print(
+                "Early stopping: "
+                f"epoch={epoch + 1} best_val_mae={best_val_mae:.4f} "
+                f"best_epoch={best_epoch} patience={args.patience}"
             )
+            break
 
     print("OK")
     return 0

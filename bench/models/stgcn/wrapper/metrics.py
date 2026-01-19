@@ -24,9 +24,9 @@ def update_metric_acc(
         abs_err = err.abs()
         acc[step]["sum_abs"] += float(abs_err.sum().item())
         acc[step]["sum_sq"] += float((err ** 2).sum().item())
-        denom = torch.clamp(y_true[:, step, :].abs(), min=1.0)  # prevent near-zero blowups
-        acc[step]["sum_mape"] += float((abs_err / (denom + eps)).sum().item())
-
+        # Using the true value as denominator (standard MAPE)
+        denom = torch.clamp(y_true[:, step, :].abs(), min=eps)
+        acc[step]["sum_mape"] += float((abs_err / denom).sum().item())
         acc[step]["count"] += float(err.numel())
 
 
