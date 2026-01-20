@@ -2,8 +2,9 @@ import argparse
 import os
 import random
 import time
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
+import math
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -98,11 +99,24 @@ def _evaluate(
     adj: torch.Tensor,
     mean: float,
     std: float,
-    mape_eps: float,
+    mape_mode: str,
+    mape_min: float,
+    debug_metrics: bool,
+    epoch: int,
+    split_name: str,
 ) -> Dict[str, Dict[str, float]]:
     model.eval()
     horizon_indices = list(HORIZON_INDICES.keys())
     acc = init_metric_acc(horizon_indices)
+    steps = None
+    y_true_stats = None
+    y_pred_stats = None
+    err_stats = None
+    if debug_metrics and epoch == 0:
+        steps = torch.tensor(horizon_indices, device=device, dtype=torch.long)
+        y_true_stats = _init_diag_stats(include_thresholds=True)
+        y_pred_stats = _init_diag_stats(include_thresholds=False)
+        err_stats = _init_diag_stats(include_thresholds=False)
     with torch.no_grad():
         for x, y in loader:
             x = x.to(device, dtype=torch.float32)
@@ -111,8 +125,45 @@ def _evaluate(
             pred = pred.permute(0, 2, 1)
             pred = pred * std + mean
             y = y * std + mean
-            update_metric_acc(acc, pred, y, horizon_indices, eps=mape_eps)
+            update_metric_acc(
+                acc,
+                pred,
+                y,
+                horizon_indices,
+                mape_mode=mape_mode,
+                mape_min=mape_min,
+            )
+            if (
+                steps is not None
+                and y_true_stats is not None
+                and y_pred_stats is not None
+                and err_stats is not None
+            ):
+                y_true_sel = y.index_select(1, steps)
+                y_pred_sel = pred.index_select(1, steps)
+                _update_diag_stats(y_true_stats, y_true_sel, mape_min=mape_min)
+                _update_diag_stats(y_pred_stats, y_pred_sel, mape_min=None)
+                _update_diag_stats(err_stats, (y_pred_sel - y_true_sel).abs(), mape_min=None)
     finalized = finalize_metric_acc(acc)
+    if mape_mode == "masked":
+        total_count = sum(stats["count"] for stats in acc.values())
+        mape_count = sum(stats["mape_count"] for stats in acc.values())
+        if total_count > 0:
+            masked_ratio = 1.0 - (mape_count / total_count)
+            if masked_ratio > 0.5:
+                print(
+                    f"Warning: Epoch {epoch + 1} {split_name} MAPE masked ratio "
+                    f"{masked_ratio * 100:.2f}% (>50%), MAPE may be unreliable."
+                )
+    if y_true_stats is not None and y_pred_stats is not None and err_stats is not None:
+        _print_diag_stats(
+            epoch=epoch,
+            split_name=split_name,
+            y_true_stats=y_true_stats,
+            y_pred_stats=y_pred_stats,
+            err_stats=err_stats,
+            mape_min=mape_min,
+        )
     results: Dict[str, Dict[str, float]] = {}
     for idx, metrics in finalized.items():
         label = HORIZON_INDICES.get(idx, str(idx))
@@ -128,6 +179,104 @@ def _format_metrics(prefix: str, metrics: Dict[str, Dict[str, float]]) -> str:
             f"{label}m MAE={m['mae']:.4f} MAPE={m['mape']:.4f} RMSE={m['rmse']:.4f}"
         )
     return f"{prefix}: " + " | ".join(parts)
+
+
+def _init_diag_stats(include_thresholds: bool) -> Dict[str, float]:
+    stats = {
+        "count": 0.0,
+        "finite_count": 0.0,
+        "sum": 0.0,
+        "sum_sq": 0.0,
+        "min": float("inf"),
+        "max": float("-inf"),
+        "nan": 0.0,
+        "inf": 0.0,
+    }
+    if include_thresholds:
+        stats["lt_eps"] = 0.0
+        stats["lt_min"] = 0.0
+    return stats
+
+
+def _update_diag_stats(
+    stats: Dict[str, float], values: torch.Tensor, mape_min: Optional[float]
+) -> None:
+    stats["count"] += float(values.numel())
+    stats["nan"] += float(torch.isnan(values).sum().item())
+    stats["inf"] += float(torch.isinf(values).sum().item())
+    if mape_min is not None:
+        stats["lt_eps"] += float((values.abs() < 1e-6).sum().item())
+        stats["lt_min"] += float((values.abs() < mape_min).sum().item())
+    finite = torch.isfinite(values)
+    if finite.any():
+        finite_vals = values[finite]
+        stats["finite_count"] += float(finite_vals.numel())
+        stats["sum"] += float(finite_vals.sum().item())
+        stats["sum_sq"] += float((finite_vals ** 2).sum().item())
+        stats["min"] = float(min(stats["min"], float(finite_vals.min().item())))
+        stats["max"] = float(max(stats["max"], float(finite_vals.max().item())))
+
+
+def _finalize_diag_stats(stats: Dict[str, float]) -> Dict[str, float]:
+    finite_count = stats["finite_count"]
+    if finite_count > 0:
+        mean = stats["sum"] / finite_count
+        var = stats["sum_sq"] / finite_count - mean ** 2
+        if var < 0.0:
+            var = 0.0
+        std = math.sqrt(var)
+        min_val = stats["min"]
+        max_val = stats["max"]
+    else:
+        mean = 0.0
+        std = 0.0
+        min_val = 0.0
+        max_val = 0.0
+    return {
+        "min": min_val,
+        "max": max_val,
+        "mean": mean,
+        "std": std,
+        "count": stats["count"],
+        "finite_count": finite_count,
+        "nan": stats["nan"],
+        "inf": stats["inf"],
+        "lt_eps": stats.get("lt_eps", 0.0),
+        "lt_min": stats.get("lt_min", 0.0),
+    }
+
+
+def _print_diag_stats(
+    epoch: int,
+    split_name: str,
+    y_true_stats: Dict[str, float],
+    y_pred_stats: Dict[str, float],
+    err_stats: Dict[str, float],
+    mape_min: float,
+) -> None:
+    y_true = _finalize_diag_stats(y_true_stats)
+    y_pred = _finalize_diag_stats(y_pred_stats)
+    err = _finalize_diag_stats(err_stats)
+    total = y_true["count"] if y_true["count"] > 0 else 1.0
+    pct_eps = (y_true["lt_eps"] / total) * 100.0
+    pct_min = (y_true["lt_min"] / total) * 100.0
+    print(
+        f"Diag Epoch {epoch + 1} {split_name} y_true: "
+        f"min={y_true['min']:.4f} max={y_true['max']:.4f} "
+        f"mean={y_true['mean']:.4f} std={y_true['std']:.4f} "
+        f"|abs|<1e-6={pct_eps:.2f}% |abs|<{mape_min}={pct_min:.2f}% "
+        f"nan={int(y_true['nan'])} inf={int(y_true['inf'])}"
+    )
+    print(
+        f"Diag Epoch {epoch + 1} {split_name} y_pred: "
+        f"min={y_pred['min']:.4f} max={y_pred['max']:.4f} "
+        f"mean={y_pred['mean']:.4f} std={y_pred['std']:.4f} "
+        f"nan={int(y_pred['nan'])} inf={int(y_pred['inf'])}"
+    )
+    print(
+        f"Diag Epoch {epoch + 1} {split_name} abs_err: "
+        f"min={err['min']:.4f} max={err['max']:.4f} mean={err['mean']:.4f}"
+    )
 
 
 def _aggregate_mae(metrics: Dict[str, Dict[str, float]]) -> float:
@@ -165,7 +314,19 @@ def main() -> int:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
-    parser.add_argument("--mape_eps", type=float, default=1e-5, help="MAPE epsilon clamp.")
+    parser.add_argument(
+        "--mape_mode",
+        choices=["masked", "clamp"],
+        default="masked",
+        help="MAPE mode (masked or clamp).",
+    )
+    parser.add_argument(
+        "--mape_min",
+        type=float,
+        default=1.0,
+        help="MAPE minimum denominator or mask threshold.",
+    )
+    parser.add_argument("--debug_metrics", type=int, default=1, help="Enable metric diagnostics (0/1).")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--min_delta", type=float, default=0.0, help="Early stopping min delta.")
     parser.add_argument("--run_id", default=None, help="Checkpoint run id (defaults to timestamp).")
@@ -254,7 +415,11 @@ def main() -> int:
             adj_tensor,
             meta["mean"],
             meta["std"],
-            args.mape_eps,
+            args.mape_mode,
+            args.mape_min,
+            args.debug_metrics == 1,
+            epoch,
+            "TRAIN",
         )
         print(_format_metrics(f"Epoch {epoch + 1} TRAIN", train_metrics))
 
@@ -266,7 +431,11 @@ def main() -> int:
                 adj_tensor,
                 meta["mean"],
                 meta["std"],
-                args.mape_eps,
+                args.mape_mode,
+                args.mape_min,
+                args.debug_metrics == 1,
+                epoch,
+                "VAL",
             )
             print(_format_metrics(f"Epoch {epoch + 1} VAL", val_metrics))
         else:
