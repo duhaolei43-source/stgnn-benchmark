@@ -6,7 +6,7 @@ from typing import List
 import numpy as np
 import pandas as pd
 
-from bench.data.splits import compute_time_split
+from bench.data.splits import compute_time_split, validate_split_ranges
 
 
 def _describe_h5_obj(key: str, obj: object) -> str:
@@ -94,6 +94,12 @@ def main() -> int:
         num_steps=num_steps,
         train_ratio=config["train_ratio"],
         val_ratio=config["val_ratio"],
+    )
+    validate_split_ranges(
+        num_steps,
+        split["train_range"],
+        split["val_range"],
+        split["test_range"],
     )
 
     output = {
