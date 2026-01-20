@@ -1,6 +1,9 @@
 import argparse
+import csv
+import datetime as dt
 import os
 import random
+import subprocess
 import time
 from typing import Dict, Optional, Tuple
 
@@ -9,12 +12,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from bench.data.splits import load_split_json
 from bench.models.stgcn.vendor.stgcn_pytorch.stgcn import STGCN
 from bench.models.stgcn.wrapper.adj import load_adjacency
 from bench.models.stgcn.wrapper.data import (
     build_sequences,
     load_metrla_h5,
-    load_split_json,
     normalize_series,
 )
 from bench.models.stgcn.wrapper.metrics import (
@@ -58,9 +61,10 @@ def _prepare_datasets(
     data = load_metrla_h5(data_path)
     num_steps, num_nodes, _ = data.shape
 
-    split = load_split_json(split_path, num_steps)
+    split = load_split_json(split_path, num_steps=num_steps)
     train_range = split["train_range"]
     val_range = split["val_range"]
+    test_range = split["test_range"]
 
     normalized, mean, std = normalize_series(data, train_range)
 
@@ -80,12 +84,21 @@ def _prepare_datasets(
         datasets["val"] = TensorDataset(
             torch.from_numpy(val_x), torch.from_numpy(val_y)
         )
+    if test_range is not None:
+        test_x, test_y = build_sequences(
+            normalized, test_range[0], test_range[1], t_in, horizon
+        )
+        datasets["test"] = TensorDataset(
+            torch.from_numpy(test_x), torch.from_numpy(test_y)
+        )
 
     meta = {
         "num_steps": num_steps,
         "num_nodes": num_nodes,
         "train_range": train_range,
         "val_range": val_range,
+        "test_range": test_range,
+        "dataset": split.get("dataset", ""),
         "mean": mean,
         "std": std,
     }
@@ -172,13 +185,73 @@ def _evaluate(
 
 
 def _format_metrics(prefix: str, metrics: Dict[str, Dict[str, float]]) -> str:
-    parts = []
+    lines = [f"{prefix}:"]
     for label in ["15", "30", "60"]:
         m = metrics.get(label, {"mae": 0.0, "mape": 0.0, "rmse": 0.0})
-        parts.append(
-            f"{label}m MAE={m['mae']:.4f} MAPE={m['mape']:.4f} RMSE={m['rmse']:.4f}"
+        lines.append(
+            f"  {label}m MAE={m['mae']:.4f} RMSE={m['rmse']:.4f} MAPE={m['mape']:.4f}"
         )
-    return f"{prefix}: " + " | ".join(parts)
+    return "\n".join(lines)
+
+
+def _idx_to_hhmm(idx: int, minutes_per_step: int = 5, steps_per_day: int = 288) -> str:
+    tod_step = idx % steps_per_day
+    minutes = tod_step * minutes_per_step
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours:02d}:{mins:02d}"
+
+
+def _range_to_str(range_value: Optional[list]) -> str:
+    if range_value is None:
+        return ""
+    return f"[{range_value[0]},{range_value[1]}]"
+
+
+def _metric_value(metrics: Optional[Dict[str, Dict[str, float]]], label: str, key: str) -> str:
+    if not metrics:
+        return ""
+    return f"{metrics.get(label, {}).get(key, 0.0):.4f}"
+
+
+def _infer_graph_info(graph_path: str) -> Dict[str, str]:
+    basename = os.path.basename(graph_path)
+    parent = os.path.basename(os.path.dirname(graph_path))
+    slot_map = {
+        "A_0.npz": ("slot0", "night", "00:00-05:55"),
+        "A_1.npz": ("slot1", "AM", "06:00-09:55"),
+        "A_2.npz": ("slot2", "midday", "10:00-15:55"),
+        "A_3.npz": ("slot3", "PM", "16:00-23:55"),
+    }
+    if parent == "dds_k4" and basename in slot_map:
+        slot, name, span = slot_map[basename]
+        return {
+            "graph_type": "dds_k4_slot",
+            "graph_slot": slot,
+            "graph_slot_name": name,
+            "graph_slot_span_hhmm": span,
+        }
+    return {
+        "graph_type": "static",
+        "graph_slot": "",
+        "graph_slot_name": "",
+        "graph_slot_span_hhmm": "",
+    }
+
+
+def _get_repo_commit(repo_root: str) -> str:
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=repo_root,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("utf-8")
+            .strip()
+        )
+    except Exception:
+        return ""
 
 
 def _init_diag_stats(include_thresholds: bool) -> Dict[str, float]:
@@ -333,6 +406,13 @@ def main() -> int:
     parser.add_argument("--wandb", type=int, default=0, help="Enable wandb (0/1).")
     parser.add_argument("--wandb_project", default="stgnn-benchmark", help="Wandb project name.")
     parser.add_argument("--wandb_run_name", default=None, help="Wandb run name.")
+    parser.add_argument("--report", type=int, default=0, help="Append CSV report row (0/1).")
+    parser.add_argument(
+        "--report_path",
+        default=os.path.join("results", "reports.csv"),
+        help="CSV report path.",
+    )
+    parser.add_argument("--report_tags", default="", help="Optional report notes/tags.")
     args = parser.parse_args()
 
     _set_seed(args.seed)
@@ -343,6 +423,9 @@ def main() -> int:
     val_loader = None
     if "val" in datasets:
         val_loader = DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False)
+    test_loader = None
+    if "test" in datasets:
+        test_loader = DataLoader(datasets["test"], batch_size=args.batch_size, shuffle=False)
 
     adj = load_adjacency(args.adj)
     if adj.shape[0] != meta["num_nodes"]:
@@ -384,7 +467,11 @@ def main() -> int:
     best_val_mae = float("inf")
     best_epoch = -1
     patience_counter = 0
+    last_epoch = -1
+    best_val_metrics: Optional[Dict[str, Dict[str, float]]] = None
+    early_stopped = 0
     for epoch in range(args.epochs):
+        last_epoch = epoch
         model.train()
         epoch_loss = 0.0
         pbar = tqdm(
@@ -467,6 +554,7 @@ def main() -> int:
             if current_val_mae < best_val_mae - args.min_delta:
                 best_val_mae = current_val_mae
                 best_epoch = epoch + 1
+                best_val_metrics = dict(val_metrics)
                 patience_counter = 0
                 best_state = _checkpoint_state(
                     model, optimizer, epoch + 1, best_val_mae, config_snapshot
@@ -486,7 +574,157 @@ def main() -> int:
                 f"epoch={epoch + 1} best_val_mae={best_val_mae:.4f} "
                 f"best_epoch={best_epoch} patience={args.patience}"
             )
+            early_stopped = 1
             break
+
+    test_metrics: Optional[Dict[str, Dict[str, float]]] = None
+    if test_loader is not None:
+        test_metrics = _evaluate(
+            model,
+            test_loader,
+            device,
+            adj_tensor,
+            meta["mean"],
+            meta["std"],
+            args.mape_mode,
+            args.mape_min,
+            False,
+            max(last_epoch, 0),
+            "TEST",
+        )
+        print(_format_metrics("TEST metrics", test_metrics))
+        if wandb is not None:
+            for label, metrics in test_metrics.items():
+                wandb.log(
+                    {
+                        f"test/mae_{label}": metrics["mae"],
+                        f"test/mape_{label}": metrics["mape"],
+                        f"test/rmse_{label}": metrics["rmse"],
+                        "epoch": max(last_epoch, 0) + 1,
+                    }
+                )
+
+    if args.report == 1:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        commit = _get_repo_commit(repo_root)
+        timestamp = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+        graph_info = _infer_graph_info(args.adj)
+        train_range = meta.get("train_range")
+        val_range = meta.get("val_range")
+        test_range = meta.get("test_range")
+        report_dir = os.path.dirname(args.report_path)
+        if report_dir:
+            os.makedirs(report_dir, exist_ok=True)
+
+        row = {
+            "timestamp_utc": timestamp,
+            "repo_commit": commit,
+            "model": "STGCN",
+            "dataset": meta.get("dataset", ""),
+            "run_id": run_id,
+            "seed": args.seed,
+            "device": str(device),
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "epochs_planned": args.epochs,
+            "epochs_ran": max(last_epoch + 1, 0),
+            "early_stopped": early_stopped,
+            "best_epoch": best_epoch,
+            "split_json": args.split,
+            "num_steps": meta.get("num_steps", ""),
+            "train_range": _range_to_str(train_range),
+            "val_range": _range_to_str(val_range),
+            "test_range": _range_to_str(test_range),
+            "train_start_hhmm": _idx_to_hhmm(train_range[0]) if train_range else "",
+            "train_end_hhmm": _idx_to_hhmm(train_range[1]) if train_range else "",
+            "val_start_hhmm": _idx_to_hhmm(val_range[0]) if val_range else "",
+            "val_end_hhmm": _idx_to_hhmm(val_range[1]) if val_range else "",
+            "test_start_hhmm": _idx_to_hhmm(test_range[0]) if test_range else "",
+            "test_end_hhmm": _idx_to_hhmm(test_range[1]) if test_range else "",
+            "graph_path": args.adj,
+            "graph_type": graph_info["graph_type"],
+            "graph_slot": graph_info["graph_slot"],
+            "graph_slot_name": graph_info["graph_slot_name"],
+            "graph_slot_span_hhmm": graph_info["graph_slot_span_hhmm"],
+            "best_val_mae_15": _metric_value(best_val_metrics, "15", "mae"),
+            "best_val_mape_15": _metric_value(best_val_metrics, "15", "mape"),
+            "best_val_rmse_15": _metric_value(best_val_metrics, "15", "rmse"),
+            "best_val_mae_30": _metric_value(best_val_metrics, "30", "mae"),
+            "best_val_mape_30": _metric_value(best_val_metrics, "30", "mape"),
+            "best_val_rmse_30": _metric_value(best_val_metrics, "30", "rmse"),
+            "best_val_mae_60": _metric_value(best_val_metrics, "60", "mae"),
+            "best_val_mape_60": _metric_value(best_val_metrics, "60", "mape"),
+            "best_val_rmse_60": _metric_value(best_val_metrics, "60", "rmse"),
+            "test_mae_15": _metric_value(test_metrics, "15", "mae"),
+            "test_mape_15": _metric_value(test_metrics, "15", "mape"),
+            "test_rmse_15": _metric_value(test_metrics, "15", "rmse"),
+            "test_mae_30": _metric_value(test_metrics, "30", "mae"),
+            "test_mape_30": _metric_value(test_metrics, "30", "mape"),
+            "test_rmse_30": _metric_value(test_metrics, "30", "rmse"),
+            "test_mae_60": _metric_value(test_metrics, "60", "mae"),
+            "test_mape_60": _metric_value(test_metrics, "60", "mape"),
+            "test_rmse_60": _metric_value(test_metrics, "60", "rmse"),
+            "notes": args.report_tags,
+        }
+
+        fieldnames = [
+            "timestamp_utc",
+            "repo_commit",
+            "model",
+            "dataset",
+            "run_id",
+            "seed",
+            "device",
+            "lr",
+            "batch_size",
+            "epochs_planned",
+            "epochs_ran",
+            "early_stopped",
+            "best_epoch",
+            "split_json",
+            "num_steps",
+            "train_range",
+            "val_range",
+            "test_range",
+            "train_start_hhmm",
+            "train_end_hhmm",
+            "val_start_hhmm",
+            "val_end_hhmm",
+            "test_start_hhmm",
+            "test_end_hhmm",
+            "graph_path",
+            "graph_type",
+            "graph_slot",
+            "graph_slot_name",
+            "graph_slot_span_hhmm",
+            "best_val_mae_15",
+            "best_val_mape_15",
+            "best_val_rmse_15",
+            "best_val_mae_30",
+            "best_val_mape_30",
+            "best_val_rmse_30",
+            "best_val_mae_60",
+            "best_val_mape_60",
+            "best_val_rmse_60",
+            "test_mae_15",
+            "test_mape_15",
+            "test_rmse_15",
+            "test_mae_30",
+            "test_mape_30",
+            "test_rmse_30",
+            "test_mae_60",
+            "test_mape_60",
+            "test_rmse_60",
+            "notes",
+        ]
+
+        file_exists = os.path.exists(args.report_path)
+        with open(args.report_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"Report: appended row to {args.report_path}")
 
     print("OK")
     return 0
