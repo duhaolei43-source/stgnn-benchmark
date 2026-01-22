@@ -7,6 +7,8 @@ Focus:
 - SPR (Structural Perturbation Robustness):
   - SCS: sensor configuration shift (feature masking)
   - TMC: topology mismatch/corruption (adjacency perturbations)
+- Measurement of models' Adaptability and Generalization ability.
+  - Unified Adaptability Score
 
 Settings:
 - Graph visibility: G (given) / L (learned) / N (no-graph)
