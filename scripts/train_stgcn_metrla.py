@@ -359,18 +359,58 @@ def _aggregate_mae(metrics: Dict[str, Dict[str, float]]) -> float:
     return float(sum(values) / len(values))
 
 
+def _capture_rng_state() -> Dict[str, object]:
+    cuda_state = None
+    if torch.cuda.is_available():
+        cuda_state = torch.cuda.random.get_rng_state_all()
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+        "cuda": cuda_state,
+    }
+
+
+def _restore_rng_state(state: Optional[Dict[str, object]]) -> None:
+    if not state:
+        return
+    python_state = state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+    numpy_state = state.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    torch_state = state.get("torch")
+    if torch_state is not None:
+        torch.random.set_rng_state(torch_state)
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.random.set_rng_state_all(cuda_state)
+
+
 def _checkpoint_state(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     best_val_mae: float,
+    best_epoch: int,
+    patience_counter: int,
     config: Dict[str, object],
 ) -> Dict[str, object]:
+    model_state = model.state_dict()
+    optimizer_state = optimizer.state_dict()
     return {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "model": model_state,
+        "model_state_dict": model_state,
+        "optimizer": optimizer_state,
+        "optimizer_state_dict": optimizer_state,
         "epoch": epoch,
+        "epoch_is_one_based": False,
         "best_val_mae": best_val_mae,
+        "best_epoch": best_epoch,
+        "patience_counter": patience_counter,
+        "rng": _capture_rng_state(),
+        "args": config,
         "config": config,
     }
 
@@ -403,6 +443,14 @@ def main() -> int:
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument("--min_delta", type=float, default=0.0, help="Early stopping min delta.")
     parser.add_argument("--run_id", default=None, help="Checkpoint run id (defaults to timestamp).")
+    parser.add_argument("--resume", type=int, default=0, help="Resume from checkpoint (0/1).")
+    parser.add_argument("--resume_ckpt", default="", help="Optional checkpoint path to resume from.")
+    parser.add_argument(
+        "--test_use_best",
+        type=int,
+        default=1,
+        help="Use best checkpoint for final test evaluation (0/1).",
+    )
     parser.add_argument("--wandb", type=int, default=0, help="Enable wandb (0/1).")
     parser.add_argument("--wandb_project", default="stgnn-benchmark", help="Wandb project name.")
     parser.add_argument("--wandb_run_name", default=None, help="Wandb run name.")
@@ -468,9 +516,46 @@ def main() -> int:
     best_epoch = -1
     patience_counter = 0
     last_epoch = -1
+    start_epoch = 0
     best_val_metrics: Optional[Dict[str, Dict[str, float]]] = None
     early_stopped = 0
-    for epoch in range(args.epochs):
+
+    if args.resume == 1:
+        resume_path = args.resume_ckpt or os.path.join(ckpt_dir, "last.pt")
+        if os.path.exists(resume_path):
+            checkpoint = torch.load(resume_path, map_location=device)
+            model_state = checkpoint.get("model") or checkpoint.get("model_state_dict")
+            if model_state is not None:
+                model.load_state_dict(model_state)
+            optimizer_state = checkpoint.get("optimizer") or checkpoint.get("optimizer_state_dict")
+            if optimizer_state is not None:
+                optimizer.load_state_dict(optimizer_state)
+            loaded_epoch = checkpoint.get("epoch")
+            epoch_is_one_based = checkpoint.get("epoch_is_one_based")
+            if isinstance(loaded_epoch, int) and loaded_epoch >= 0:
+                if epoch_is_one_based is None or epoch_is_one_based is True:
+                    start_epoch = loaded_epoch
+                else:
+                    start_epoch = loaded_epoch + 1
+            loaded_best_val = checkpoint.get("best_val_mae")
+            if loaded_best_val is not None:
+                best_val_mae = float(loaded_best_val)
+            loaded_best_epoch = checkpoint.get("best_epoch")
+            if loaded_best_epoch is not None:
+                best_epoch = int(loaded_best_epoch)
+            loaded_patience = checkpoint.get("patience_counter")
+            if loaded_patience is not None:
+                patience_counter = int(loaded_patience)
+            _restore_rng_state(checkpoint.get("rng"))
+            print(
+                "Resume: loaded "
+                f"{resume_path} start_epoch={start_epoch} "
+                f"best_val_mae={best_val_mae} best_epoch={best_epoch}"
+            )
+        else:
+            print(f"Resume: checkpoint not found at {resume_path}, starting fresh.")
+
+    for epoch in range(start_epoch, args.epochs):
         last_epoch = epoch
         model.train()
         epoch_loss = 0.0
@@ -557,14 +642,26 @@ def main() -> int:
                 best_val_metrics = dict(val_metrics)
                 patience_counter = 0
                 best_state = _checkpoint_state(
-                    model, optimizer, epoch + 1, best_val_mae, config_snapshot
+                    model,
+                    optimizer,
+                    epoch,
+                    best_val_mae,
+                    best_epoch,
+                    patience_counter,
+                    config_snapshot,
                 )
                 torch.save(best_state, os.path.join(ckpt_dir, "best.pt"))
             else:
                 patience_counter += 1
 
         last_state = _checkpoint_state(
-            model, optimizer, epoch + 1, best_val_mae, config_snapshot
+            model,
+            optimizer,
+            epoch,
+            best_val_mae,
+            best_epoch,
+            patience_counter,
+            config_snapshot,
         )
         torch.save(last_state, os.path.join(ckpt_dir, "last.pt"))
 
@@ -579,6 +676,19 @@ def main() -> int:
 
     test_metrics: Optional[Dict[str, Dict[str, float]]] = None
     if test_loader is not None:
+        if args.test_use_best == 1:
+            best_path = os.path.join(ckpt_dir, "best.pt")
+            if os.path.exists(best_path):
+                checkpoint = torch.load(best_path, map_location=device)
+                model_state = checkpoint.get("model") or checkpoint.get("model_state_dict")
+                if model_state is not None:
+                    model.load_state_dict(model_state)
+                best_epoch = int(checkpoint.get("best_epoch", best_epoch))
+                best_val_mae = float(checkpoint.get("best_val_mae", best_val_mae))
+                print(
+                    "Test: using best checkpoint best.pt "
+                    f"(epoch={best_epoch}, best_val_mae={best_val_mae})"
+                )
         test_metrics = _evaluate(
             model,
             test_loader,
